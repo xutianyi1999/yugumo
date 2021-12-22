@@ -1,0 +1,15 @@
+[package]
+name = "yugumo"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "io-util", "rt", "rt-multi-thread", "net"] }
+log = "0.4"
+log4rs = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
