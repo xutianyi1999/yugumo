@@ -9,6 +9,7 @@ edition = "2021"
 tokio = { version = "1", features = ["macros", "io-util", "rt", "rt-multi-thread", "net"] }
 log = "0.4"
 log4rs = "1"
+socket2 = "0.4"
 
 [profile.release]
 lto = true

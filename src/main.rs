@@ -5,12 +5,14 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
+use log::LevelFilter;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Root};
-use log4rs::Config;
 use log4rs::encode::pattern::PatternEncoder;
-use log::LevelFilter;
+use log4rs::Config;
+use socket2::TcpKeepalive;
 use tokio::net::{TcpListener, TcpStream};
 
 fn logger_init() {
@@ -39,6 +41,29 @@ fn zip<T1, T2, E1, E2>(a: Result<T1, E1>, b: Result<T2, E2>) -> Option<(T1, T2)>
         _ => None,
     }
 }
+
+pub trait SocketExt {
+    fn set_keepalive(&self) -> io::Result<()>;
+}
+
+const TCP_KEEPALIVE: TcpKeepalive = TcpKeepalive::new().with_time(Duration::from_secs(120));
+
+macro_rules! build_socket_ext {
+    ($type:path) => {
+        impl<T: $type> SocketExt for T {
+            fn set_keepalive(&self) -> io::Result<()> {
+                let sock_ref = socket2::SockRef::from(self);
+                sock_ref.set_tcp_keepalive(&TCP_KEEPALIVE)
+            }
+        }
+    };
+}
+
+#[cfg(windows)]
+build_socket_ext!(std::os::windows::io::AsRawSocket);
+
+#[cfg(unix)]
+build_socket_ext!(std::os::unix::io::AsRawFd);
 
 #[tokio::main]
 async fn main() {
@@ -73,11 +98,14 @@ async fn main() {
                         debug!("{} forward to {}", peer_addr, dest);
 
                         let res = async move {
+                            source_stream.set_keepalive()?;
+
                             let mut dest_stream = TcpStream::connect(dest).await?;
+                            dest_stream.set_keepalive()?;
                             tokio::io::copy_bidirectional(&mut source_stream, &mut dest_stream).await?;
                             Result::<(), io::Error>::Ok(())
                         }
-                            .await;
+                        .await;
 
                         if let Err(e) = res {
                             error!("{} forward error: {:?}", peer_addr, e)
