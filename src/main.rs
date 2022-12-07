@@ -250,7 +250,7 @@ async fn tcp_handler(
             }.await;
 
             if let Err(e) = res {
-                error!("{} forward error: {:?}", peer_addr, e)
+                error!("{} forward error: {}", peer_addr, e)
             }
         });
     }
@@ -304,7 +304,7 @@ fn main() -> io::Result<()> {
             }
         }
 
-        serves.push(tokio::spawn(clock_task(clock)));
+        tokio::spawn(clock_task(clock));
 
         for h in serves {
             if let Err(e) = h.await {
