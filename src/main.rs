@@ -222,6 +222,7 @@ async fn udp_handler(
             };
         };
 
+        debug!("{} send to {}", peer, to);
         dst_socket.send_to(&buff[..len], to).await?;
         update_time.store(clock.load(Ordering::Relaxed), Ordering::Relaxed);
     }
