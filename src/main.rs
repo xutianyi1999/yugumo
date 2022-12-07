@@ -201,7 +201,6 @@ async fn udp_handler(
                                         tokio::time::sleep(Duration::from_secs(5)).await;
 
                                         if clock.load(Ordering::Relaxed) - timestamp.load(Ordering::Relaxed) > 300 {
-                                            mapping.update(|m| m.remove(&peer));
                                             return;
                                         }
                                     }
@@ -211,6 +210,8 @@ async fn udp_handler(
                                     res = fut1 => res,
                                     _ = fut2 => Ok(())
                                 };
+
+                                mapping.update(|m| m.remove(&peer));
 
                                 if let Err(e) = res {
                                     error!("Child udp handler error: {}", e);
