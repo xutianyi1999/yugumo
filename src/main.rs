@@ -69,14 +69,14 @@ async fn udp_handler(
 ) -> io::Result<()> {
     // (peer, to socket, update timestamp)
     let mapping: &'static ArcSwap<Vec<Arc<(SocketAddr, UdpSocket, AtomicI64)>>> = Box::leak(Box::new(ArcSwap::from_pointee(Vec::new())));
-    let socket: &'static UdpSocket = Box::leak(Box::new(UdpSocket::bind(bind).await?));
+    let local_socket: &'static UdpSocket = Box::leak(Box::new(UdpSocket::bind(bind).await?));
     info!("{} -> {} udp serve start", bind, to);
 
     let mut buff = vec![0u8; 65536];
     let mut mapping_cache = Cache::new(mapping);
 
     loop {
-        let (len, peer) = socket.recv_from(&mut buff).await?;
+        let (len, peer) = local_socket.recv_from(&mut buff).await?;
         let snap = mapping_cache.load();
 
         let item = snap.binary_search_by_key(&peer, |v| (**v).0)
@@ -118,9 +118,9 @@ async fn udp_handler(
 
                         let fut1 = async {
                             loop {
-                                let (len, from) = to_socket.recv_from(&mut buff).await?;
-                                debug!("recv from {} to {}", from, peer);
-                                socket.send_to(&buff[..len], peer).await?;
+                                let len = to_socket.recv(&mut buff).await?;
+                                debug!("recv from {} to {}", to, peer);
+                                local_socket.send_to(&buff[..len], peer).await?;
                                 update_time.store(Utc::now().timestamp(), Ordering::Relaxed);
                             }
                         };
