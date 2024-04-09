@@ -76,7 +76,14 @@ async fn udp_handler(
     let mut mapping_cache = Cache::new(mapping);
 
     loop {
-        let (len, peer) = local_socket.recv_from(&mut buff).await?;
+        let (len, peer) = match local_socket.recv_from(&mut buff).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("udp socket error: {}", e);
+                continue;
+            }
+        };
+
         let snap = mapping_cache.load();
 
         let item = snap.binary_search_by_key(&peer, |v| (**v).0)
@@ -161,6 +168,7 @@ async fn udp_handler(
             Some(v) => v
         };
 
+        debug!("{} send to {}", peer, to);
         to_socket.send(&buff[..len]).await?;
         update_time.store(Utc::now().timestamp(), Ordering::Relaxed);
     }
