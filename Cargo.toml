@@ -9,11 +9,10 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
 log4rs = "1"
-socket2 = "0.4"
-ahash = "0.8"
+socket2 = "0.5"
 chrono = "0.4"
-parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
+arc-swap = "1"
 
 [profile.release]
 lto = true

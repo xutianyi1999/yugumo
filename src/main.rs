@@ -6,10 +6,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use ahash::{HashMap, HashMapExt};
+use arc_swap::{ArcSwap, Cache};
 use chrono::Utc;
 use clap::{arg, Parser};
 use log4rs::append::console::ConsoleAppender;
@@ -17,14 +17,13 @@ use log4rs::config::{Appender, Root};
 use log4rs::Config;
 use log4rs::encode::pattern::PatternEncoder;
 use log::LevelFilter;
-use parking_lot::RwLock;
 use socket2::TcpKeepalive;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 fn logger_init() {
     let stdout = ConsoleAppender::builder()
         .encoder(Box::new(PatternEncoder::new(
-            "[Console] {d(%Y-%m-%d %H:%M:%S)} - {l} - {m}{n}",
+            "[{d(%Y-%m-%d %H:%M:%S)}] {h({l})} {t} - {m}{n}"
         )))
         .build();
 
@@ -32,7 +31,7 @@ fn logger_init() {
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
         .build(
             Root::builder().appender("stdout").build(
-                LevelFilter::from_str(&std::env::var("RUST_LOG").unwrap_or(String::from("INFO")))
+                LevelFilter::from_str(std::env::var("YUGUMO_LOG").as_deref().unwrap_or("INFO"))
                     .unwrap(),
             ),
         )
@@ -59,179 +58,116 @@ macro_rules! build_socket_ext {
 }
 
 #[cfg(windows)]
-build_socket_ext!(std::os::windows::io::AsRawSocket);
+build_socket_ext!(std::os::windows::io::AsSocket);
 
 #[cfg(unix)]
-build_socket_ext!(std::os::unix::io::AsRawFd);
-
-struct ConcurrentCache<V> {
-    version: AtomicUsize,
-    inner: RwLock<V>,
-}
-
-impl<V: Clone> ConcurrentCache<V> {
-    fn new(v: V) -> Self {
-        ConcurrentCache {
-            version: AtomicUsize::new(0),
-            inner: RwLock::new(v),
-        }
-    }
-
-    #[allow(unused)]
-    fn try_update<R, F: FnOnce(&mut V) -> R>(&self, f: F) -> Result<R, F> {
-        match self.inner.try_write() {
-            Some(mut v) => {
-                self.version.fetch_add(1, Ordering::Relaxed);
-                Ok(f(&mut *v))
-            }
-            None => return Err(f),
-        }
-    }
-
-    fn update<R, F: FnOnce(&mut V) -> R>(&self, f: F) -> R {
-        let mut guard = self.inner.write();
-        self.version.fetch_add(1, Ordering::Relaxed);
-        f(&mut *guard)
-    }
-
-    #[allow(unused)]
-    fn try_load(&self) -> Option<V> {
-        self.inner.try_read().map(|v| v.clone())
-    }
-
-    fn load(&self) -> V {
-        self.inner.read().clone()
-    }
-
-    fn guard(&self) -> Guard<V> {
-        let version = self.version.load(Ordering::Acquire);
-        let v = self.load();
-
-        Guard {
-            cache: self,
-            v,
-            version,
-        }
-    }
-}
-
-struct Guard<'a, V> {
-    cache: &'a ConcurrentCache<V>,
-    v: V,
-    version: usize,
-}
-
-impl<V: Clone> Guard<'_, V> {
-    fn sync(&mut self) {
-        let cache_version = self.cache.version.load(Ordering::Acquire);
-
-        if self.version == cache_version {
-            return;
-        }
-
-        self.v = self.cache.load();
-        self.version = cache_version;
-    }
-}
-
-impl<V> Deref for Guard<'_, V> {
-    type Target = V;
-
-    fn deref(&self) -> &Self::Target {
-        &self.v
-    }
-}
-
-async fn clock_task(local_clock: &'static AtomicI64) {
-    loop {
-        local_clock.store(Utc::now().timestamp(), Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
+build_socket_ext!(std::os::unix::io::AsFd);
 
 async fn udp_handler(
-    bind: &'static str,
-    to: &'static str,
-    mapping: &'static ConcurrentCache<HashMap<SocketAddr, Arc<(UdpSocket, AtomicI64)>>>,
-    clock: &'static AtomicI64,
+    bind: &str,
+    to: &str,
 ) -> io::Result<()> {
+    // (peer, to socket, update timestamp)
+    let mapping: &'static ArcSwap<Vec<Arc<(SocketAddr, UdpSocket, AtomicI64)>>> = Box::leak(Box::new(ArcSwap::from_pointee(Vec::new())));
     let socket: &'static UdpSocket = Box::leak(Box::new(UdpSocket::bind(bind).await?));
     info!("{} -> {} udp serve start", bind, to);
 
     let mut buff = vec![0u8; 65536];
-    let mut guard = mapping.guard();
+    let mut mapping_cache = Cache::new(mapping);
 
     loop {
         let (len, peer) = socket.recv_from(&mut buff).await?;
+        let snap = mapping_cache.load();
 
-        let (dst_socket, update_time) = loop {
-            guard.sync();
+        let item = snap.binary_search_by_key(&peer, |v| (**v).0)
+            .ok()
+            .map(|i| &*snap.deref()[i]);
 
-            match guard.get(&peer) {
-                None => {
-                    let to = tokio::net::lookup_host(to).await?.next().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Parse dest address failure"))?;
+        let insert_item;
 
-                    let bind_addr = match to {
-                        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-                        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-                    };
+        let (_, to_socket, update_time) = match item {
+            None => {
+                let to = tokio::net::lookup_host(to).await?.next().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "parse dest address failure"))?;
 
-                    let new_socket = UdpSocket::bind(bind_addr).await?;
+                let bind_addr = match to {
+                    SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+                };
 
-                    mapping.update(|map| {
-                        if !map.contains_key(&peer) {
-                            let v = Arc::new((new_socket, AtomicI64::new(clock.load(Ordering::Relaxed))));
-                            map.insert(peer, v.clone());
+                let to_socket = UdpSocket::bind(bind_addr).await?;
+                to_socket.connect(to).await?;
 
-                            tokio::spawn(async move {
-                                let (dst_socket, timestamp) = &*v;
-                                let mut buff = vec![0u8; 65536];
+                insert_item = Arc::new((peer, to_socket, AtomicI64::new(Utc::now().timestamp())));
 
-                                let fut1 = async {
-                                    loop {
-                                        let (len, from) = dst_socket.recv_from(&mut buff).await?;
-                                        debug!("recv from {} to {}", from, peer);
-                                        socket.send_to(&buff[..len], peer).await?;
-                                        timestamp.store(clock.load(Ordering::Relaxed), Ordering::Relaxed);
-                                    }
-                                };
+                mapping.rcu(|v| {
+                    let mut tmp = (**v).clone();
 
-                                let fut2 = async {
-                                    loop {
-                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    match tmp.binary_search_by_key(&peer, |v| (**v).0) {
+                        Ok(_) => unreachable!(),
+                        Err(i) => tmp.insert(i, insert_item.clone()),
+                    }
+                    tmp
+                });
 
-                                        if clock.load(Ordering::Relaxed) - timestamp.load(Ordering::Relaxed) > 300 {
-                                            return;
-                                        }
-                                    }
-                                };
+                tokio::spawn({
+                    let insert_item = insert_item.clone();
 
-                                let res: io::Result<()> = tokio::select! {
-                                    res = fut1 => res,
-                                    _ = fut2 => Ok(())
-                                };
+                    async move {
+                        let (_, to_socket, update_time) = &*insert_item;
+                        let mut buff = vec![0u8; 65536];
 
-                                mapping.update(|m| m.remove(&peer));
+                        let fut1 = async {
+                            loop {
+                                let (len, from) = to_socket.recv_from(&mut buff).await?;
+                                debug!("recv from {} to {}", from, peer);
+                                socket.send_to(&buff[..len], peer).await?;
+                                update_time.store(Utc::now().timestamp(), Ordering::Relaxed);
+                            }
+                        };
 
-                                if let Err(e) = res {
-                                    error!("Child udp handler error: {}", e);
+                        let fut2 = async {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                                if Utc::now().timestamp() - update_time.load(Ordering::Relaxed) > 300 {
+                                    return;
                                 }
-                            });
+                            }
+                        };
+
+                        let res: io::Result<()> = tokio::select! {
+                            res = fut1 => res,
+                            _ = fut2 => Ok(())
+                        };
+
+                        if let Err(e) = res {
+                            error!("child udp handler error: {}", e);
                         }
-                    })
-                }
-                Some(v) => break &**v
-            };
+
+                        mapping.rcu(|v| {
+                            let mut tmp = (**v).clone();
+
+                            match tmp.binary_search_by_key(&peer, |v| (**v).0) {
+                                Ok(i) => tmp.remove(i),
+                                Err(_) => unreachable!(),
+                            };
+                            tmp
+                        });
+                    }
+                });
+
+                &*insert_item
+            }
+            Some(v) => v
         };
 
-        debug!("{} send to {}", peer, to);
-        dst_socket.send_to(&buff[..len], to).await?;
-        update_time.store(clock.load(Ordering::Relaxed), Ordering::Relaxed);
+        to_socket.send(&buff[..len]).await?;
+        update_time.store(Utc::now().timestamp(), Ordering::Relaxed);
     }
 }
 
 async fn tcp_handler(
-    bind: &'static str,
+    bind: &str,
     to: &'static str,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
@@ -292,14 +228,12 @@ fn main() -> io::Result<()> {
             }
         }
 
-        let mapping = &*Box::leak(Box::new(ConcurrentCache::new(HashMap::new())));
-        let clock = &*Box::leak(Box::new(AtomicI64::new(Utc::now().timestamp())));
-
         for v in args.udp {
             let v: &'static str = &**Box::leak(Box::new(v));
+
             if let Some((bind, to)) = v.split_once("->") {
                 let fut = tokio::spawn(async move {
-                    if let Err(e) = udp_handler(bind, to, mapping, clock).await {
+                    if let Err(e) = udp_handler(bind, to).await {
                         error!("UDP handler error: {}", e)
                     }
                 });
@@ -307,11 +241,9 @@ fn main() -> io::Result<()> {
             }
         }
 
-        tokio::spawn(clock_task(clock));
-
         for h in serves {
             if let Err(e) = h.await {
-                error!("Process error: {}", e)
+                error!("servers error: {}", e)
             }
         }
     });
