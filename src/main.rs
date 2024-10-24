@@ -5,18 +5,18 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Deref;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Cache};
 use chrono::Utc;
 use clap::{arg, Parser};
+use log::LevelFilter;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Root};
-use log4rs::Config;
 use log4rs::encode::pattern::PatternEncoder;
-use log::LevelFilter;
+use log4rs::Config;
 use socket2::TcpKeepalive;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -192,7 +192,16 @@ async fn tcp_handler(
 
                 let mut dest_stream = TcpStream::connect(to).await?;
                 dest_stream.set_keepalive()?;
-                tokio::io::copy_bidirectional(&mut source_stream, &mut dest_stream).await?;
+
+                #[cfg(target_os = "linux")]
+                {
+                    tokio_splice::zero_copy_bidirectional(&mut source_stream, &mut dest_stream).await?;
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    tokio::io::copy_bidirectional(&mut source_stream, &mut dest_stream).await?;
+                }
                 Result::<(), io::Error>::Ok(())
             }.await;
 
