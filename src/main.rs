@@ -182,7 +182,13 @@ async fn tcp_handler(
     info!("{} -> {} tcp serve start", bind, to);
 
     loop {
-        let (mut source_stream, peer_addr) = listener.accept().await?;
+        let (mut source_stream, peer_addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("tcp accept error: {}", e);
+                continue;
+            }
+        };
 
         tokio::spawn(async move {
             debug!("{} forward to {}", peer_addr, to);
